@@ -23,7 +23,7 @@ CAR_Y_COORDS = [
     [14, 15],
     [24, 25]
 ]
-CAR_COVERAGE_X = 3  # 车辆在x方向(行)的覆盖范围
+CAR_COVERAGE_X = 2  # 车辆在x方向(行)的覆盖范围
 CAR_TRIP_DURATION = 100  # 车辆单程运行时间 (秒)
 
 # 信号带宽函数参数 (S2GL)
@@ -34,3 +34,6 @@ BW_PERIOD = 10      # 带宽函数周期 (秒)
 TOTAL_FLOWS = 1800         # 数据流总数
 FLOW_DATA_SIZE = 10        # 每个流的总数据量 (Mb)
 FLOW_UPLOAD_RATE = 5       # 单个流上传至车的固定速率 (Mbps)
+
+# 新算法参数
+MAX_PATH_LENGTH = 20 # 最短路径的跳数限制

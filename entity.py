@@ -1,6 +1,7 @@
 # entity.py
 
 import numpy as np
+from pyparsing import C
 from config import *
 
 class DataFlow:
@@ -13,7 +14,7 @@ class DataFlow:
         self.remaining_data = FLOW_DATA_SIZE
         self.status = "waiting"  # waiting, active, completed
         self.end_time = -1
-        self.path_history = {} # 记录每秒的路径 {time_k: path_list}
+        self.flow_sent_history = {} # {time_k: amount_sent}
 
     def __repr__(self):
         return f"Flow({self.id}, Source:{self.source_node}, Start:{self.start_time}, Left:{self.remaining_data:.2f}Mb)"
@@ -31,15 +32,27 @@ class MobileCar:
         # 假设车辆从x=0开始移动
         # Python索引从0开始，所以x坐标范围是0到M_ROWS-1
         start_x_float = self.speed * time_k
-        start_x_int = int(np.floor(start_x_float))
+        start_x_int = int(np.ceil(start_x_float))
 
         self.coverage_area.clear()
         for x_offset in range(CAR_COVERAGE_X):
             current_x = start_x_int + x_offset
             if 0 <= current_x < M_ROWS:
                 for y in self.y_coords:
-                    if 0 <= y < N_COLS:
-                        self.coverage_area.add((current_x, y))
+                    self.coverage_area.add((current_x, y))
+
+        if start_x_int == start_x_float:
+            for y in self.y_coords:
+                self.coverage_area.add((start_x_int + CAR_COVERAGE_X, y))
+        else:
+            pre_two_point = [(start_x_int-1, y) for y in self.y_coords]
+            last_two_point = [(start_x_int+CAR_COVERAGE_X, y) for y in self.y_coords]
+            pre_sum = sum(get_s2gl_bandwidth(x, y, time_k) for x, y in pre_two_point)
+            last_sum = sum(get_s2gl_bandwidth(x, y, time_k) for x, y in last_two_point)
+            if pre_sum >= last_sum:
+                self.coverage_area.add((x, y) for x, y in pre_two_point)
+            else:
+                self.coverage_area.add((x, y) for x, y in last_two_point)
 
     def __repr__(self):
         return f"Car({self.id}, Y-coords:{self.y_coords}, Coverage Size:{len(self.coverage_area)})"
