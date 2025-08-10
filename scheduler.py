@@ -1,5 +1,6 @@
 # scheduler.py
 
+from time import sleep
 import networkx as nx
 import numpy as np
 from collections import defaultdict
@@ -154,78 +155,89 @@ class Scheduler:
         self.total_flow_sent += flow_value
         
         temp_sent_amounts = defaultdict(float)
-        #TODO 4. 更新数据流状态,如何恢复快照更新
         # 5. 根据流量分配结果，精确更新每个数据流的状态
         if flow_value > 0 and flow_dict:
             source_flows_out = flow_dict.get(SUPER_SOURCE, {})
             
             for s_node, flow_out_of_s_node in source_flows_out.items():
-                if flow_out_of_s_node <= 0:
+                if flow_out_of_s_node <= 1e-9: # 使用小阈值避免浮点数问题
                     continue
 
-                s_flows = source_nodes_map.get(s_node)
-                if not s_flows:
-                    assert False, f"源节点 {s_node} 没有对应的流"
+                s_flows_at_node = source_nodes_map.get(s_node)
+                if not s_flows_at_node:
+                    continue
 
-                #####
-                
-                # --- 开始迭代分配 ---
+                # --- 开始多轮注水法迭代分配 ---
                 flow_to_distribute = flow_out_of_s_node
-                # 创建一个可修改的流列表副本
-                flows_to_process = s_flows.copy()
-                # 记录每个流已分配的量
-                unsaturated_flows = []
+                # 筛选出当前节点上所有有待发送数据的流
+                flows_to_process = [f for f in s_flows_at_node if f.remaining_data > 1e-9]
+                
+                # 循环分配，直到流量分配完毕或所有流都达到上限
+                while flow_to_distribute > 1e-9 and flows_to_process:
+                    # 计算当前待处理流在本时间步还能接收的总容量
+                    total_capacity_this_round = 0
+                    for f in flows_to_process:
+                        # 单个流的剩余容量受限于“剩余数据量”和“单步速率上限”
+                        capacity = min(
+                            f.remaining_data - temp_sent_amounts[f.id],
+                            (FLOW_UPLOAD_RATE * TIME_STEP) - temp_sent_amounts[f.id]
+                        )
+                        total_capacity_this_round += capacity
 
-                flows_to_process.sort(key=lambda f: f.remaining_data, reverse=True)  # 按剩余数据量降序排序
-                for f in flows_to_process:
-                    current_total_remaining = sum(f.remaining_data for f in flows_to_process)
-                    # 1. 计算此流按比例应得的份额
-                    ratio = f.remaining_data  / current_total_remaining
-                    proportional_share = flow_to_distribute * ratio
-
-                    # 2. 计算此流在本时间步内还能接收的最大流量
-                    max_can_sent = min(
-                        f.remaining_data ,
-                        FLOW_UPLOAD_RATE * TIME_STEP 
-                    )
-
-                    # 3. 确定本轮实际分配给此流的量
-                    amount_to_sent = min(proportional_share, max_can_sent)
-
-                    temp_sent_amounts[f.id] = amount_to_sent
-                    flow_to_distribute -= amount_to_sent
-
-                    # 4. 如果此流的限额已满，则在下一轮不再参与分配
-                    if amount_to_sent < max_can_sent:
-                        unsaturated_flows.append(f)
-                    # 从待处理列表中移除已经“饱和”的流
-                    flows_to_process.remove(f)
-                    if flow_to_distribute <= 0:
+                    if total_capacity_this_round <= 1e-9:
+                        # 如果所有待处理的流都没有容量了，则停止分配
                         break
 
-                if flow_to_distribute > 0:
-                    unsaturated_flows.sort(key=lambda f: f.remaining_data, reverse=True)  # 按剩余数据量升序排序
-                    for f in unsaturated_flows:
-                        # 如果还有剩余流量未分配，继续分配给未饱和的流
-                        max_can_sent = min(f.remaining_data, FLOW_UPLOAD_RATE * TIME_STEP)
-                        new_addable_flow = max_can_sent - temp_sent_amounts[f.id]
-                        assert new_addable_flow > 0,"对的是饱和的这么跑这儿了？？"
-                        if new_addable_flow <= flow_to_distribute:
-                            temp_sent_amounts[f.id] = max_can_sent
-                            flow_to_distribute -= new_addable_flow
-                        else:
-                            temp_sent_amounts[f.id] += flow_to_distribute
-                            assert temp_sent_amounts[f.id] <= max_can_sent, "分配量超过了最大可接收量"
-                            flow_to_distribute = 0
-                
-                for f in s_flows:
-                    f.remaining_data -= temp_sent_amounts[f.id]
-                    f.flow_sent_history[k] = (temp_sent_amounts[f.id])
-                    if temp_sent_amounts[f.id] > 0:
-                        assert f.start_time <= k and f.status == "active", f"流 {f.id} 状态不正确"
-                    if f.remaining_data <= 0:
+                    # 按比例分配当前轮次的流量
+                    newly_saturated_flows = []
+                    for f in flows_to_process:
+                        # 计算此流还能接收的最大量
+                        max_can_receive = min(
+                            f.remaining_data - temp_sent_amounts[f.id],
+                            (FLOW_UPLOAD_RATE * TIME_STEP) - temp_sent_amounts[f.id]
+                        )
+                        
+                        if max_can_receive <= 0:
+                            newly_saturated_flows.append(f)
+                            continue
+
+                        # 按可接收容量的比例，计算应得份额
+                        ratio = max_can_receive / total_capacity_this_round
+                        proportional_share = flow_to_distribute * ratio
+                        
+                        # 实际分配量不能超过该流本轮能接收的最大量
+                        amount_to_add = min(proportional_share, max_can_receive)
+                        
+                        temp_sent_amounts[f.id] += amount_to_add
+
+                    # 更新剩余待分配流量
+                    flow_to_distribute -= sum(temp_sent_amounts[f.id] for f in flows_to_process)
+                    
+                    # 重新计算所有流的已分配量，以更新待分配流量
+                    total_allocated = sum(temp_sent_amounts[f.id] for f in s_flows_at_node)
+                    flow_to_distribute = flow_out_of_s_node - total_allocated
+
+                    # 从待处理列表中移除已经“饱和”的流
+                    flows_to_process = [
+                        f for f in flows_to_process 
+                        if (f.remaining_data - temp_sent_amounts[f.id] > 1e-9) and 
+                           ((FLOW_UPLOAD_RATE * TIME_STEP) - temp_sent_amounts[f.id] > 1e-9)
+                    ]
+
+            # --- 迭代分配结束，根据最终结果更新所有流的状态 ---
+            for f in self.flows:
+                sent_amount = temp_sent_amounts.get(f.id, 0)
+                if sent_amount > 1e-9:
+                    f.remaining_data -= sent_amount
+                    f.flow_sent_history[k] = sent_amount
+                    
+                    if f.status == 'waiting':
+                        f.status = 'active'
+                    
+                    if f.remaining_data <= 1e-9:
+                        f.remaining_data = 0
                         f.status = "completed"
-                        f.end_time = k + 1
+                        f.end_time = k + TIME_STEP
 
         # 5. 保存当前时间步的策略快照
         snapshot = {
