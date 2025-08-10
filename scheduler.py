@@ -6,6 +6,7 @@ import numpy as np
 from collections import defaultdict
 from tqdm import tqdm
 from config import *
+import config
 from entity import DataFlow, MobileCar, get_s2gl_bandwidth
 from datetime import datetime
 
@@ -234,6 +235,10 @@ class Scheduler:
 
         car_bandwidth_usage_rate = {car.id: car_received_data[car.id] / car_bandwidth_sums[car.id] if car_bandwidth_sums[car.id] > 0 else 0 for car in self.cars}
 
+        # 当前时间步 理论最大上传流量
+        theoretical_max_upload_forstepk = 0
+        for car in self.cars:
+            theoretical_max_upload_forstepk += min(config.B_RECEIVE, car_bandwidth_sums[car.id])
 
         # 5. 保存当前时间步的策略快照
         snapshot = {
@@ -242,7 +247,8 @@ class Scheduler:
             'car_coverages': {car.id: car.coverage_area.copy() for car in self.cars},
             'link_flow': flow_dict,  # networkx返回的原始边流量
             'flow_sent_details': temp_sent_amounts.copy(),  # {flow_id: sent_amount}
-            'car_bandwidth_usage_rate': car_bandwidth_usage_rate
+            'car_bandwidth_usage_rate': car_bandwidth_usage_rate,
+            'theoretical_max_upload_forstepk': theoretical_max_upload_forstepk
         }
         self.snapshots.append(snapshot)
 
@@ -265,24 +271,34 @@ class Scheduler:
 
         avg_car_bandwidth_usage_rate = {car_id: rate / len(self.snapshots) for car_id, rate in avg_car_bandwidth_usage_rate.items()}
 
+        # 理论最大上传流量
+        theoretical_max_upload = sum(snapshot['theoretical_max_upload_forstepk'] for snapshot in self.snapshots)
+        theoretical_min_loss_rate = 1 - (theoretical_max_upload / total_data_generated) 
+
         print("\n--- 性能评估---")
+        print(f"传感器到车带宽峰值:{config.B_PEAK} 车到服务器上传带宽上限:{config.B_RECEIVE}")
         print(f"总生成流量: {total_data_generated:.2f} Mb")
         print(f"总接收流量: {total_data_received:.2f} Mb")
         print(f"丢包率: {loss_rate:.2%}")
         print(f"完成传输的流数量: {len(completed_flows)} / {len(self.flows)}")
         print(f"已完成流的平均时延: {avg_delay:.2f} 秒")
         print(f"车辆平均带宽使用率: {avg_car_bandwidth_usage_rate}")
-        
+        print(f"理论最大上传流量: {theoretical_max_upload:.2f} Mb")
+        print(f"理论最小丢包率: {theoretical_min_loss_rate:.2%}")
+
         # 将打印结果追加保存到文本文件，标题带上系统时间
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         with open("simulation_results.txt", "a", encoding="utf-8") as f:
             f.write(f"\n--- 性能评估 [{now}] ---\n")
+            f.write(f"传感器到车带宽峰值: {config.B_PEAK} 车到服务器上传带宽上限: {config.B_RECEIVE}\n")
             f.write(f"总生成流量: {total_data_generated:.2f} Mb\n")
             f.write(f"总接收流量: {total_data_received:.2f} Mb\n")
             f.write(f"丢包率: {loss_rate:.2%}\n")
             f.write(f"完成传输的流数量: {len(completed_flows)} / {len(self.flows)}\n")
             f.write(f"已完成流的平均时延: {avg_delay:.2f} 秒\n")
             f.write(f"车辆平均带宽使用率: {avg_car_bandwidth_usage_rate}\n")
+            f.write(f"理论最大上传流量: {theoretical_max_upload:.2f} Mb\n")
+            f.write(f"理论最小丢包率: {theoretical_min_loss_rate:.2%}\n")
 
         return {
             "loss_rate": loss_rate, "avg_delay": avg_delay,
