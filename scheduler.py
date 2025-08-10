@@ -6,6 +6,7 @@ from collections import defaultdict
 from tqdm import tqdm
 from config import *
 from entity import DataFlow, MobileCar, get_s2gl_bandwidth
+from datetime import datetime
 
 class Scheduler:
     """
@@ -92,9 +93,9 @@ class Scheduler:
             car.update_position(k)
 
         active_flows = [f for f in self.flows if f.start_time <= k and f.status != "completed"]
-        if not active_flows:
-            self.snapshots.append({'time': k, 'flow_value': 0, 'flow_dict': {}})
-            return
+
+        for f in active_flows:
+            f.status = "active"
 
         source_nodes_map = defaultdict(list)
         for f in active_flows:
@@ -149,44 +150,94 @@ class Scheduler:
                 flow_value, flow_dict = nx.maximum_flow(G_flow, SUPER_SOURCE, SUPER_SINK)
             except Exception:
                 pass #TODO 忽略一些可能因图结构产生的异常???!
-
-        # 4. 保存当前时间步的策略快照
-        snapshot = {
-            'time': k,
-            'flow_value': flow_value,
-            'flow_dict': flow_dict, # 保存完整的流量分配细节
-            'g_flow_structure': {
-                'nodes': list(G_flow.nodes()),
-                'edges': [(u, v, G_flow.get_edge_data(u, v)) for u, v in G_flow.edges()]
-            }
-        }
-        self.snapshots.append(snapshot)
         
         self.total_flow_sent += flow_value
         
-        #TODO 5. 更新数据流状态,如何恢复快照更新
-        if flow_value > 0:
-            for s_node, s_flows in source_nodes_map.items():
-                if SUPER_SOURCE in flow_dict and s_node in flow_dict[SUPER_SOURCE]:
-                    flow_out_of_s_node = flow_dict[SUPER_SOURCE][s_node]
-                    
-                    # 按比例精确分配已发送的流量
-                    total_remaining = sum(f.remaining_data for f in s_flows)
-                    if total_remaining > 0:
-                        for f in s_flows:
-                            ratio = f.remaining_data / total_remaining
-                            sent_amount = min(f.remaining_data, flow_out_of_s_node * ratio)
-                            f.remaining_data -= sent_amount
-                            f.flow_sent_history[k] = sent_amount
-                            if f.status == 'waiting': f.status = 'active'
-                            if f.remaining_data <= 1e-6:
-                                f.remaining_data = 0
-                                f.status = 'completed'
-                                f.end_time = k + 1
+        temp_sent_amounts = defaultdict(float)
+        #TODO 4. 更新数据流状态,如何恢复快照更新
+        # 5. 根据流量分配结果，精确更新每个数据流的状态
+        if flow_value > 0 and flow_dict:
+            source_flows_out = flow_dict.get(SUPER_SOURCE, {})
+            
+            for s_node, flow_out_of_s_node in source_flows_out.items():
+                if flow_out_of_s_node <= 0:
+                    continue
+
+                s_flows = source_nodes_map.get(s_node)
+                if not s_flows:
+                    assert False, f"源节点 {s_node} 没有对应的流"
+
+                #####
+                
+                # --- 开始迭代分配 ---
+                flow_to_distribute = flow_out_of_s_node
+                # 创建一个可修改的流列表副本
+                flows_to_process = s_flows.copy()
+                # 记录每个流已分配的量
+                unsaturated_flows = []
+
+                flows_to_process.sort(key=lambda f: f.remaining_data, reverse=True)  # 按剩余数据量降序排序
+                for f in flows_to_process:
+                    current_total_remaining = sum(f.remaining_data for f in flows_to_process)
+                    # 1. 计算此流按比例应得的份额
+                    ratio = f.remaining_data  / current_total_remaining
+                    proportional_share = flow_to_distribute * ratio
+
+                    # 2. 计算此流在本时间步内还能接收的最大流量
+                    max_can_sent = min(
+                        f.remaining_data ,
+                        FLOW_UPLOAD_RATE * TIME_STEP 
+                    )
+
+                    # 3. 确定本轮实际分配给此流的量
+                    amount_to_sent = min(proportional_share, max_can_sent)
+
+                    temp_sent_amounts[f.id] = amount_to_sent
+                    flow_to_distribute -= amount_to_sent
+
+                    # 4. 如果此流的限额已满，则在下一轮不再参与分配
+                    if amount_to_sent < max_can_sent:
+                        unsaturated_flows.append(f)
+                    # 从待处理列表中移除已经“饱和”的流
+                    flows_to_process.remove(f)
+                    if flow_to_distribute <= 0:
+                        break
+
+                if flow_to_distribute > 0:
+                    unsaturated_flows.sort(key=lambda f: f.remaining_data, reverse=True)  # 按剩余数据量升序排序
+                    for f in unsaturated_flows:
+                        # 如果还有剩余流量未分配，继续分配给未饱和的流
+                        max_can_sent = min(f.remaining_data, FLOW_UPLOAD_RATE * TIME_STEP)
+                        new_addable_flow = max_can_sent - temp_sent_amounts[f.id]
+                        assert new_addable_flow > 0,"对的是饱和的这么跑这儿了？？"
+                        if new_addable_flow <= flow_to_distribute:
+                            temp_sent_amounts[f.id] = max_can_sent
+                            flow_to_distribute -= new_addable_flow
+                        else:
+                            temp_sent_amounts[f.id] += flow_to_distribute
+                            assert temp_sent_amounts[f.id] <= max_can_sent, "分配量超过了最大可接收量"
+                            flow_to_distribute = 0
+                
+                for f in s_flows:
+                    f.remaining_data -= temp_sent_amounts[f.id]
+                    f.flow_sent_history[k] = (temp_sent_amounts[f.id])
+                    if temp_sent_amounts[f.id] > 0:
+                        assert f.start_time <= k and f.status == "active", f"流 {f.id} 状态不正确"
+                    if f.remaining_data <= 0:
+                        f.status = "completed"
+                        f.end_time = k + 1
+
+        # 5. 保存当前时间步的策略快照
+        snapshot = {
+            'time': k,
+            'flow_value': flow_value,
+            'car_coverages': {car.id: car.coverage_area.copy() for car in self.cars},
+            'link_flow': flow_dict,  # networkx返回的原始边流量
+            'flow_sent_details': temp_sent_amounts.copy() # {flow_id: sent_amount}
+        }
+        self.snapshots.append(snapshot)
 
     def get_results(self):
-        # ... (此函数与上一版类似，但现在可以额外返回snapshots) ...
-        # (代码与上一版相同)
         completed_flows = [f for f in self.flows if f.status == "completed"]
         total_data_generated = len(self.flows) * FLOW_DATA_SIZE
         
@@ -195,13 +246,23 @@ class Scheduler:
         loss_rate = 1 - (total_data_received / total_data_generated) if total_data_generated > 0 else 0
         avg_delay = np.mean([f.end_time - f.start_time for f in completed_flows]) if completed_flows else float('inf')
         
-        print("\n--- 性能评估 (最大流精确子图版) ---")
+        print("\n--- 性能评估---")
         print(f"总生成流量: {total_data_generated:.2f} Mb")
         print(f"总接收流量: {total_data_received:.2f} Mb")
         print(f"丢包率: {loss_rate:.2%}")
         print(f"完成传输的流数量: {len(completed_flows)} / {len(self.flows)}")
         print(f"已完成流的平均时延: {avg_delay:.2f} 秒")
         
+        # 将打印结果追加保存到文本文件，标题带上系统时间
+        now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        with open("simulation_results.txt", "a", encoding="utf-8") as f:
+            f.write(f"\n--- 性能评估 [{now}] ---\n")
+            f.write(f"总生成流量: {total_data_generated:.2f} Mb\n")
+            f.write(f"总接收流量: {total_data_received:.2f} Mb\n")
+            f.write(f"丢包率: {loss_rate:.2%}\n")
+            f.write(f"完成传输的流数量: {len(completed_flows)} / {len(self.flows)}\n")
+            f.write(f"已完成流的平均时延: {avg_delay:.2f} 秒\n")
+
         return {
             "loss_rate": loss_rate, "avg_delay": avg_delay,
             "completed_count": len(completed_flows),

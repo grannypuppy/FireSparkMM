@@ -50,9 +50,11 @@ class MobileCar:
             pre_sum = sum(get_s2gl_bandwidth(x, y, time_k) for x, y in pre_two_point)
             last_sum = sum(get_s2gl_bandwidth(x, y, time_k) for x, y in last_two_point)
             if pre_sum >= last_sum:
-                self.coverage_area.add((x, y) for x, y in pre_two_point)
+                for x, y in pre_two_point:
+                    self.coverage_area.add((x, y))
             else:
-                self.coverage_area.add((x, y) for x, y in last_two_point)
+                for x, y in last_two_point:
+                    self.coverage_area.add((x, y))
 
     def __repr__(self):
         return f"Car({self.id}, Y-coords:{self.y_coords}, Coverage Size:{len(self.coverage_area)})"
