@@ -1,5 +1,6 @@
 # scheduler.py
 
+from re import S
 import networkx as nx
 import numpy as np
 from collections import defaultdict
@@ -134,13 +135,13 @@ class Scheduler:
                 capacity = min(FLOW_UPLOAD_RATE * len(s_flows), total_remaining)
                 G_flow.add_edge(SUPER_SOURCE, s_node, capacity=capacity)
 
-        for e_node in valid_exit_nodes:
-            bw = get_s2gl_bandwidth(e_node[0], e_node[1], k)
-            if bw > 0:
-                for car in self.cars:
-                    if e_node in car.coverage_area:
-                        G_flow.add_edge(e_node, f'C_{car.id}', capacity=bw)
-                        break
+        car_bandwidth_sums = defaultdict(float)
+        for car in self.cars:
+            for e_node in car.coverage_area:
+                bw = get_s2gl_bandwidth(e_node[0], e_node[1], k)
+                if bw > 0:
+                    G_flow.add_edge(e_node, f'C_{car.id}', capacity=bw)
+                    car_bandwidth_sums[car.id] += bw
 
         # 3. 求解最大流
         flow_value = 0
@@ -225,7 +226,14 @@ class Scheduler:
                         assert f.start_time <= k and f.status == "active", f"流 {f.id} 状态不正确"
                     if f.remaining_data <= 0:
                         f.status = "completed"
-                        f.end_time = k + 1
+                        f.end_time = k + TIME_STEP
+
+        car_received_data = defaultdict(float)
+        for car in self.cars:
+            car_received_data[car.id] = flow_dict[f'C_{car.id}'][SUPER_SINK]
+
+        car_bandwidth_usage_rate = {car.id: car_received_data[car.id] / car_bandwidth_sums[car.id] if car_bandwidth_sums[car.id] > 0 else 0 for car in self.cars}
+
 
         # 5. 保存当前时间步的策略快照
         snapshot = {
@@ -233,9 +241,13 @@ class Scheduler:
             'flow_value': flow_value,
             'car_coverages': {car.id: car.coverage_area.copy() for car in self.cars},
             'link_flow': flow_dict,  # networkx返回的原始边流量
-            'flow_sent_details': temp_sent_amounts.copy() # {flow_id: sent_amount}
+            'flow_sent_details': temp_sent_amounts.copy(),  # {flow_id: sent_amount}
+            'car_bandwidth_usage_rate': car_bandwidth_usage_rate
         }
         self.snapshots.append(snapshot)
+
+        print(f"时间步: {k}")
+        print(f"车辆带宽使用率: {car_bandwidth_usage_rate}")
 
     def get_results(self):
         completed_flows = [f for f in self.flows if f.status == "completed"]
@@ -245,13 +257,21 @@ class Scheduler:
         
         loss_rate = 1 - (total_data_received / total_data_generated) if total_data_generated > 0 else 0
         avg_delay = np.mean([f.end_time - f.start_time for f in completed_flows]) if completed_flows else float('inf')
-        
+
+        avg_car_bandwidth_usage_rate = defaultdict(float)
+        for snapshot in self.snapshots:
+            for car_id, rate in snapshot['car_bandwidth_usage_rate'].items():
+                avg_car_bandwidth_usage_rate[car_id] += rate
+
+        avg_car_bandwidth_usage_rate = {car_id: rate / len(self.snapshots) for car_id, rate in avg_car_bandwidth_usage_rate.items()}
+
         print("\n--- 性能评估---")
         print(f"总生成流量: {total_data_generated:.2f} Mb")
         print(f"总接收流量: {total_data_received:.2f} Mb")
         print(f"丢包率: {loss_rate:.2%}")
         print(f"完成传输的流数量: {len(completed_flows)} / {len(self.flows)}")
         print(f"已完成流的平均时延: {avg_delay:.2f} 秒")
+        print(f"车辆平均带宽使用率: {avg_car_bandwidth_usage_rate}")
         
         # 将打印结果追加保存到文本文件，标题带上系统时间
         now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -262,6 +282,7 @@ class Scheduler:
             f.write(f"丢包率: {loss_rate:.2%}\n")
             f.write(f"完成传输的流数量: {len(completed_flows)} / {len(self.flows)}\n")
             f.write(f"已完成流的平均时延: {avg_delay:.2f} 秒\n")
+            f.write(f"车辆平均带宽使用率: {avg_car_bandwidth_usage_rate}\n")
 
         return {
             "loss_rate": loss_rate, "avg_delay": avg_delay,
